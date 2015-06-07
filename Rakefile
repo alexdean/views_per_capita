@@ -32,10 +32,14 @@ task :create_functions do
   db.exec sql
 end
 
+desc "create (or re-create) the locations and cells tables"
 task :create_tables do
+  db.exec "DROP TABLE IF EXISTS locations"
   sql = <<-EOF
-  CREATE TABLE IF NOT EXISTS locations (
+  CREATE TABLE locations (
     id integer primary key,
+    total_views integer,
+    cell_id integer,
     latitude numeric (8,5),
     longitude numeric (8,5)
   );
@@ -43,12 +47,15 @@ task :create_tables do
   db.exec sql
   db.exec "SELECT AddGeometryColumn('locations', 'point', 4326, 'POINT', 2, false)"
   db.exec "create index on locations using gist (point)"
+  db.exec "create index on locations (cell_id)"
 
-  db.exec "CREATE TABLE IF NOT EXISTS cells (id serial primary key, population integer);"
+  db.exec "DROP TABLE IF EXISTS cells"
+  db.exec "CREATE TABLE cells (id serial primary key, population integer, total_views integer, views_per_capita numeric (10,5));"
   db.exec "SELECT AddGeometryColumn('cells', 'geom', 4326, 'POLYGON', 2);"
   db.exec "CREATE INDEX ON cells USING GIST (geom);"
 end
 
+desc "populate (or re-populate) the cells table, and calcualte cell population from county data. do this after the counties data is loaded."
 task :build_grid do
   # build a grid that covers the entire area where we have locations
   # parameters determined manually.
@@ -126,9 +133,9 @@ end
 
 counties_base = 'County_2010Census_DP1'
 counties_zip_file = "source_data/#{counties_base}.zip"
-counties_source_url = 'http://www2.census.gov/geo/tiger/TIGER2010DP1/County_2010Census_DP1.zip'
+counties_source_url = "http://www2.census.gov/geo/tiger/TIGER2010DP1/#{counties_base}.zip"
 task counties_zip_file do
-  # `wget -O #{counties_zip_file} #{counties_source_url}`
+  `wget -O #{counties_zip_file} #{counties_source_url}`
 
   if ! File.exist?(counties_zip_file) || File.size(counties_zip_file) == 0
     puts "#{counties_zip_file} is missing, and downloading from #{counties_source_url} failed."
@@ -143,32 +150,62 @@ task counties_zip_file do
     exit
   end
 end
+desc "fetch county definitions from Census Bureau website"
 task counties_zip_file: counties_zip_file
 
+desc "create (or re-create) the counties table and load data from Census Bureau shapefile"
 task load_counties: :counties_zip_file do
   db.exec "DROP TABLE IF EXISTS counties"
   `rm -Rf tmp/#{counties_base}`
   `unzip -o -d tmp/#{counties_base} #{counties_zip_file}`
-  `shp2pgsql -s 4326 -t 2D -W LATIN1 -I source_data/County_2010Census_DP1/County_2010Census_DP1.shp counties > tmp/counties.sql`
+  `shp2pgsql -s 4326 -t 2D -W LATIN1 -I tmp/#{counties_base}/#{counties_base}.shp counties > tmp/counties.sql`
   `psql #{db_name} < tmp/counties.sql`
   db.exec "ALTER TABLE counties RENAME COLUMN dp0010001 TO total_population"
   db.exec "ALTER TABLE counties RENAME COLUMN namelsad10 TO name"
 end
 
+states_base = "cb_2013_us_state_500k"
+states_zip_file = "source_data/#{states_base}.zip"
+states_source_url = "http://www2.census.gov/geo/tiger/GENZ2013/#{states_base}.zip"
+task states_zip_file do
+  `wget -O #{states_zip_file} #{states_source_url}`
+end
+task states_zip_file: states_zip_file
+
+desc "create (or re-create) the states table"
+task load_states: :states_zip_file do
+  db.exec "DROP TABLE IF EXISTS states"
+  `rm -Rf tmp/#{states_base}`
+  `unzip -o -d tmp/#{states_base} #{states_zip_file}`
+  `shp2pgsql -s 4326 -t 2D -W LATIN1 -I tmp/#{states_base}/#{states_base}.shp states > tmp/states.sql`
+  `psql #{db_name} < tmp/states.sql`
+end
+
+desc "load locations data from TED videometrics csv exports"
 task :load_locations do
+  db.exec "DELETE FROM locations"
+
   # from videometrics database
   # SELECT id, latitude, longitude FROM locations WHERE country_id = 10;
   # export to locations.csv
-  csv_file = 'source_data/locations.csv'
+  location_csv = 'source_data/locations.csv'
+  # SELECT location_id, count(*) as total_views FROM events WHERE happened_at BETWEEN '2015-01-01 08:00:00' AND '2015-06-01 07:59:59' GROUP BY location_id;
+  views_per_location_csv = 'source_data/views_per_location.csv'
 
   sql_file = 'tmp/locations.sql'
 
+  views_per_location = {}
+  CSV.foreach(views_per_location_csv, headers: true) do |line|
+    views_per_location[line['location_id'].to_i] = line['total_views']
+  end
+
   out = File.open(sql_file, 'w')
-  CSV.foreach(csv_file, headers: true) do |line|
+  CSV.foreach(location_csv, headers: true) do |line|
     sql = <<-EOF
-      INSERT INTO locations (id, latitude, longitude, point)
+      INSERT INTO locations (id, total_views, latitude, longitude, point)
       VALUES (
         #{line['id']},
+        #{views_per_location[line['id'].to_i].to_i},
         #{line['latitude']},
         #{line['longitude']},
         ST_SetSRID(ST_Point(#{line['longitude']}, #{line['latitude']}), 4326));
@@ -176,11 +213,46 @@ task :load_locations do
     out.write(sql.gsub(/\n */, " ").strip+"\n")
   end
   out.close
-exit
+
   `psql #{db_name} < #{sql_file}`
 end
 
+desc "populate locations.cell_id foreign key, describing which cell each location is within"
+task :associate_cells_and_locations do
+  sql = <<-EOF
+    SELECT
+      ce.id,
+      array_to_string(array_agg(l.id), ',') as location_ids
+    FROM cells ce
+      LEFT JOIN locations l ON ST_Contains(ce.geom, l.point)
+    GROUP BY
+      ce.id
+  EOF
+  result = db.exec sql
+  result.each do |row|
+    db.exec("UPDATE locations SET cell_id = #{row['id']} WHERE id IN (#{row['location_ids']})")
+  end
+end
 
+task :calculate_views_per_capita do
+  sql = <<-EOF
+    UPDATE cells c
+    SET total_views = x.total_views
+    FROM (
+      SELECT
+        ce.id,
+        SUM(l.total_views) as total_views
+      FROM cells ce
+        INNER JOIN locations l ON (ce.id = l.cell_id)
+      GROUP BY
+        ce.id
+    ) x
+    WHERE c.id = x.id
+  EOF
+  db.exec sql
+
+  db.exec "UPDATE cells SET views_per_capita = total_views/population::float WHERE population > 0"
+end
 
 
 
