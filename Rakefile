@@ -9,8 +9,35 @@ def db
   @db ||= PG.connect(dbname: db_name)
 end
 
+def table_exists?(table_name)
+  result = db.exec "select count(*) as table_exists from pg_tables where tablename = '#{table_name}'"
+  result[0]['table_exists'] == '0' ? false : true
+end
 
-task :create_functions do
+def load_shp_file(table:, source_zip:)
+  db.exec "DROP TABLE IF EXISTS #{table}"
+
+  ext = File.extname(source_zip)
+  base = File.basename(source_zip, ext)
+
+  tmp_dir = "tmp/#{base}"
+  out_sql = "tmp/#{table}.sql"
+
+  `rm -Rf #{tmp_dir}`
+  `unzip -o -d #{tmp_dir} #{source_zip}`
+  `shp2pgsql -s 4326 -t 2D -W LATIN1 -I #{tmp_dir}/#{base}.shp #{table} > #{out_sql}`
+  `psql #{db_name} < #{out_sql}`
+end
+
+task :initial_setup do
+  result = PG.connect.exec "select count(*) as db_exists from pg_database where datname = '#{db_name}'"
+  if result[0]['db_exists'] == '0'
+    `createdb #{db_name}`
+    `echo 'create extension postgis' | psql #{db_name}`
+  end
+end
+
+task create_functions: :initial_setup do
   # http://www.faqoverflow.com/gis/16374.html
   sql = <<-EOF
   CREATE OR REPLACE FUNCTION ST_CreateFishnet(
@@ -33,30 +60,33 @@ task :create_functions do
 end
 
 desc "create (or re-create) the locations and cells tables"
-task :create_tables do
-  db.exec "DROP TABLE IF EXISTS locations"
-  sql = <<-EOF
-  CREATE TABLE locations (
-    id integer primary key,
-    total_views integer,
-    cell_id integer,
-    latitude numeric (8,5),
-    longitude numeric (8,5)
-  );
-  EOF
-  db.exec sql
-  db.exec "SELECT AddGeometryColumn('locations', 'point', 4326, 'POINT', 2, false)"
-  db.exec "create index on locations using gist (point)"
-  db.exec "create index on locations (cell_id)"
+task create_tables: :initial_setup do
+  if ! table_exists?('locations')
+    sql = <<-EOF
+    CREATE TABLE locations (
+      id integer primary key,
+      total_views integer,
+      cell_id integer,
+      latitude numeric (8,5),
+      longitude numeric (8,5)
+    );
+    EOF
+    db.exec sql
+    db.exec "SELECT AddGeometryColumn('locations', 'point', 4326, 'POINT', 2, false)"
+    db.exec "create index on locations using gist (point)"
+    db.exec "create index on locations (cell_id)"
+  end
 
-  db.exec "DROP TABLE IF EXISTS cells"
-  db.exec "CREATE TABLE cells (id serial primary key, population integer, total_views integer, views_per_capita numeric (10,5));"
-  db.exec "SELECT AddGeometryColumn('cells', 'geom', 4326, 'POLYGON', 2);"
-  db.exec "CREATE INDEX ON cells USING GIST (geom);"
+  if ! table_exists?('cells')
+    db.exec "CREATE TABLE cells (id serial primary key, population integer, total_views integer, views_per_capita numeric (10,5));"
+    db.exec "SELECT AddGeometryColumn('cells', 'geom', 4326, 'POLYGON', 2);"
+    db.exec "CREATE INDEX ON cells USING GIST (geom);"
+  end
 end
 
 desc "populate (or re-populate) the cells table, and calcualte cell population from county data. do this after the counties data is loaded."
-task :build_grid do
+task load_cells: [:create_functions, :create_tables, :load_counties] do
+# task :load_cells do
   # build a grid that covers the entire area where we have locations
   # parameters determined manually.
   db.exec "delete from cells"
@@ -99,7 +129,7 @@ task :build_grid do
     sql = <<-EOF
       SELECT
         co.name,
-        co.total_population,
+        co.pop_est_2014,
         ST_Area(ST_Intersection(ce.geom, co.geom)) as overlap_area,
         ST_Area(co.geom) as total_county_area
       FROM cells ce
@@ -116,12 +146,13 @@ task :build_grid do
       cell_population += pct_of_county_population_in_cell.to_i
     end
 
-    db.exec "UPDATE cells SET population = #{cell_population} WHERE id = #{row['id']}"
+    sql = "UPDATE cells SET population = #{cell_population} WHERE id = #{row['id']}"
+    db.exec sql
 
-    if idx > 0 && idx % 50 == 0
+    if idx > 0 && idx % 10 == 0
       print '.'
 
-      if idx % 200 == 0
+      if idx % 100 == 0
         print " #{(idx/cell_count*100).round}%"
         puts
       end
@@ -132,21 +163,21 @@ task :build_grid do
 end
 
 population_updates_base = 'CO-EST2014-alldata'
-population_updates_csv = "source_data/#{population_updates_base}.csv"
+population_updates_file = "source_data/#{population_updates_base}.csv"
 population_updates_source_url = "http://www.census.gov/popest/data/counties/totals/2014/files/#{population_updates_base}.csv"
 desc "fetch population updates 2010-2014"
-file population_updates_csv do
-  if ! File.exist?(population_updates_csv)
-    `wget -O #{population_updates_csv} #{population_updates_source_url}`
+file population_updates_file do
+  if ! File.exist?(population_updates_file)
+    `wget -O #{population_updates_file} #{population_updates_source_url}`
   end
 
-  if ! File.exist?(population_updates_csv) || File.size(population_updates_csv) == 0
-    puts "#{population_updates_csv} is missing. Downloading from #{population_updates_source_url} failed."
+  if ! File.exist?(population_updates_file) || File.size(population_updates_file) == 0
+    puts "#{population_updates_file} is missing. Downloading from #{population_updates_source_url} failed."
     exit 1
   end
 end
 desc "fetch csv of county population updates"
-task population_updates_csv: population_updates_csv
+task population_updates_file: population_updates_file
 
 counties_base = 'County_2010Census_DP1'
 counties_zip_file = "source_data/#{counties_base}.zip"
@@ -171,19 +202,21 @@ desc "fetch county definitions from Census Bureau website"
 task counties_zip_file: counties_zip_file
 
 desc "create (or re-create) the counties table and load data from Census Bureau shapefile"
-task load_counties: [counties_zip_file, population_updates_csv] do
-  db.exec "DROP TABLE IF EXISTS counties"
-  `rm -Rf tmp/#{counties_base}`
-  `unzip -o -d tmp/#{counties_base} #{counties_zip_file}`
-  `shp2pgsql -s 4326 -t 2D -W LATIN1 -I tmp/#{counties_base}/#{counties_base}.shp counties > tmp/counties.sql`
-  `psql #{db_name} < tmp/counties.sql`
+task load_counties: [counties_zip_file, population_updates_file] do
+  load_shp_file(table: 'counties', source_zip: counties_zip_file)
   db.exec "ALTER TABLE counties RENAME COLUMN dp0010001 TO total_population"
   db.exec "ALTER TABLE counties RENAME COLUMN namelsad10 TO name"
   db.exec "ALTER TABLE counties ADD pop_est_2010 integer, ADD pop_est_2014 integer"
 
-  CSV.foreach(population_updates_csv, encoding: "iso-8859-1:UTF-8", headers: true) do |line|
+  CSV.foreach(population_updates_file, encoding: "iso-8859-1:UTF-8", headers: true) do |line|
     fips = line['STATE'] + line['COUNTY']
-    sql = "UPDATE counties SET pop_est_2010 = #{line['POPESTIMATE2010']}, pop_est_2014 = #{line['POPESTIMATE2014']} WHERE geoid10 = '#{fips}'"
+    sql = <<-EOF
+      UPDATE counties
+      SET
+        pop_est_2010 = #{line['POPESTIMATE2010']},
+        pop_est_2014 = #{line['POPESTIMATE2014']}
+      WHERE geoid10 = '#{fips}'
+    EOF
     # puts line['STNAME'] + ' ' + line['CTYNAME']
     # puts sql
     db.exec sql
@@ -204,15 +237,11 @@ task states_zip_file: states_zip_file
 
 desc "create (or re-create) the states table"
 task load_states: states_zip_file do
-  db.exec "DROP TABLE IF EXISTS states"
-  `rm -Rf tmp/#{states_base}`
-  `unzip -o -d tmp/#{states_base} #{states_zip_file}`
-  `shp2pgsql -s 4326 -t 2D -W LATIN1 -I tmp/#{states_base}/#{states_base}.shp states > tmp/states.sql`
-  `psql #{db_name} < tmp/states.sql`
+  load_shp_file(table: 'states', source_zip: states_zip_file)
 end
 
 desc "load locations data from TED videometrics csv exports"
-task :load_locations do
+task load_locations: :create_tables do
   db.exec "DELETE FROM locations"
 
   # from videometrics database
@@ -248,7 +277,7 @@ task :load_locations do
 end
 
 desc "populate locations.cell_id foreign key, describing which cell each location is within"
-task :associate_cells_and_locations do
+task associate_cells_and_locations: [:load_locations, :load_cells] do
   sql = <<-EOF
     SELECT
       ce.id,
@@ -264,7 +293,7 @@ task :associate_cells_and_locations do
   end
 end
 
-task :calculate_views_per_capita do
+task calculate_views_per_capita: :associate_cells_and_locations do
   sql = <<-EOF
     UPDATE cells c
     SET total_views = x.total_views
@@ -284,6 +313,5 @@ task :calculate_views_per_capita do
   db.exec "UPDATE cells SET views_per_capita = total_views/population::float WHERE population > 0"
 end
 
-
-
+task default: [:calculate_views_per_capita, :load_states]
 
