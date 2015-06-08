@@ -9,6 +9,10 @@ def db
   @db ||= PG.connect(dbname: db_name)
 end
 
+def srid
+  4326
+end
+
 def table_exists?(table_name)
   result = db.exec "select count(*) as table_exists from pg_tables where tablename = '#{table_name}'"
   result[0]['table_exists'] == '0' ? false : true
@@ -25,7 +29,7 @@ def load_shp_file(table:, source_zip:)
 
   `rm -Rf #{tmp_dir}`
   `unzip -o -d #{tmp_dir} #{source_zip}`
-  `shp2pgsql -s 4326 -t 2D -W LATIN1 -I #{tmp_dir}/#{base}.shp #{table} > #{out_sql}`
+  `shp2pgsql -s #{srid} -t 2D -W LATIN1 -I #{tmp_dir}/#{base}.shp #{table} > #{out_sql}`
   `psql #{db_name} < #{out_sql}`
 end
 
@@ -34,6 +38,8 @@ task :initial_setup do
   if result[0]['db_exists'] == '0'
     `createdb #{db_name}`
     `echo 'create extension postgis' | psql #{db_name}`
+  else
+    puts "Database #{db_name} already exists. Not creating."
   end
 end
 
@@ -72,14 +78,14 @@ task create_tables: :initial_setup do
     );
     EOF
     db.exec sql
-    db.exec "SELECT AddGeometryColumn('locations', 'point', 4326, 'POINT', 2, false)"
+    db.exec "SELECT AddGeometryColumn('locations', 'point', #{srid}, 'POINT', 2, false)"
     db.exec "create index on locations using gist (point)"
     db.exec "create index on locations (cell_id)"
   end
 
   if ! table_exists?('cells')
     db.exec "CREATE TABLE cells (id serial primary key, population integer, total_views integer, views_per_capita numeric (10,5));"
-    db.exec "SELECT AddGeometryColumn('cells', 'geom', 4326, 'POLYGON', 2);"
+    db.exec "SELECT AddGeometryColumn('cells', 'geom', #{srid}, 'POLYGON', 2);"
     db.exec "CREATE INDEX ON cells USING GIST (geom);"
   end
 end
@@ -90,7 +96,7 @@ task load_cells: [:create_functions, :create_tables, :load_counties] do
   # build a grid that covers the entire area where we have locations
   # parameters determined manually.
   db.exec "delete from cells"
-  db.exec "insert into cells (geom) select ST_SetSRID(geom, 4326) from ST_CreateFishnet(57, 115, 1, 1, -180, 15)"
+  db.exec "insert into cells (geom) select ST_SetSRID(geom, #{srid}) from ST_CreateFishnet(57, 115, 1, 1, -180, 15)"
 
   # remove cells which have no locations
   # should be able to do this with one query, but getting unexpected results
@@ -267,7 +273,7 @@ task load_locations: :create_tables do
         #{views_per_location[line['id'].to_i].to_i},
         #{line['latitude']},
         #{line['longitude']},
-        ST_SetSRID(ST_Point(#{line['longitude']}, #{line['latitude']}), 4326));
+        ST_SetSRID(ST_Point(#{line['longitude']}, #{line['latitude']}), #{srid}));
     EOF
     out.write(sql.gsub(/\n */, " ").strip+"\n")
   end
