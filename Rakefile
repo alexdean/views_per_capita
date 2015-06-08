@@ -239,6 +239,7 @@ file states_zip_file do
     exit 1
   end
 end
+desc "fetch state outlines shapefile from US Census Bureau"
 task states_zip_file: states_zip_file
 
 desc "create (or re-create) the states table"
@@ -299,6 +300,7 @@ task associate_cells_and_locations: [:load_locations, :load_cells] do
   end
 end
 
+desc "calcuate views per capita for all grid cells"
 task calculate_views_per_capita: :associate_cells_and_locations do
   sql = <<-EOF
     UPDATE cells c
