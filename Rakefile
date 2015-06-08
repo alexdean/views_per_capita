@@ -179,6 +179,7 @@ file population_updates_file do
 
   if ! File.exist?(population_updates_file) || File.size(population_updates_file) == 0
     puts "#{population_updates_file} is missing. Downloading from #{population_updates_source_url} failed."
+    puts "Try visting http://www.census.gov/popest/data/counties/totals/2014/CO-EST2014-alldata.html to find a replacement."
     exit 1
   end
 end
@@ -236,6 +237,7 @@ file states_zip_file do
   `wget -O #{states_zip_file} #{states_source_url}`
   if ! File.exist?(states_zip_file) || File.size(states_zip_file) == 0
     puts "#{states_zip_file} is missing. Downloading from #{states_source_url} failed."
+    puts "Try visiting http://www.census.gov/geo/maps-data/data/cbf/cbf_state.html to find a replacement."
     exit 1
   end
 end
