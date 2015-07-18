@@ -33,6 +33,8 @@ def load_shp_file(table:, source_zip:)
   `psql #{db_name} < #{out_sql}`
 end
 
+root_dir = Dir.getwd
+
 task :initial_setup do
   result = PG.connect.exec "select count(*) as db_exists from pg_database where datname = '#{db_name}'"
   if result[0]['db_exists'] == '0'
@@ -247,6 +249,38 @@ task states_zip_file: states_zip_file
 desc "create (or re-create) the states table"
 task load_states: states_zip_file do
   load_shp_file(table: 'states', source_zip: states_zip_file)
+end
+
+cities_tarball_base = "citiesx010g_shp_nt00962"
+cities_tarball = "source_data/#{cities_tarball_base}.tar.gz"
+cities_shpfile_base = "citiesx010g"
+cities_source_url = "http://dds.cr.usgs.gov/pub/data/nationalatlas/#{cities_tarball_base}.tar.gz"
+file cities_tarball do
+  `wget -O #{cities_tarball} #{cities_source_url}`
+  if ! File.exist?(cities_tarball) || File.size(cities_tarball) == 0
+    puts "#{cities_tarball} is missing. Downloading from #{cities_source_url} failed."
+    puts "Try visiting http://catalog.data.gov/dataset/cities-and-towns-of-the-united-states-direct-download/resource/f9fefcc9-5d26-437a-8435-9e388faded0f to find a replacement."
+    exit 1
+  end
+end
+
+desc "create (or re-create) the states table"
+task load_cities: cities_tarball do
+  table_name = 'cities'
+  db.exec "DROP TABLE IF EXISTS #{table_name}"
+
+
+  tmp_dir = "tmp/#{cities_tarball_base}"
+  out_sql = "tmp/#{table_name}.sql"
+
+  `rm -Rf #{tmp_dir}`
+  `mkdir -p #{tmp_dir}`
+  `cp #{cities_tarball} #{tmp_dir}`
+  Dir.chdir tmp_dir do
+    `tar xzvf ../../#{cities_tarball}`
+    `shp2pgsql -s #{srid} -t 2D -W LATIN1 -I #{cities_shpfile_base}.shp #{table_name} > #{File.join(root_dir,out_sql)}`
+  end
+  `psql #{db_name} < #{File.join(root_dir,out_sql)}`
 end
 
 desc "load locations data from TED videometrics csv exports"
