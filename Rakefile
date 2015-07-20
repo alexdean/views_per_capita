@@ -35,7 +35,7 @@ end
 
 root_dir = Dir.getwd
 
-task :initial_setup do
+task :setup do
   result = PG.connect.exec "select count(*) as db_exists from pg_database where datname = '#{db_name}'"
   if result[0]['db_exists'] == '0'
     `createdb #{db_name}`
@@ -43,9 +43,7 @@ task :initial_setup do
   else
     puts "Database #{db_name} already exists. Not creating."
   end
-end
 
-task create_functions: :initial_setup do
   # http://www.faqoverflow.com/gis/16374.html
   sql = <<-EOF
   CREATE OR REPLACE FUNCTION ST_CreateFishnet(
@@ -53,115 +51,160 @@ task create_functions: :initial_setup do
           xsize float8, ysize float8,
           x0 float8 DEFAULT 0, y0 float8 DEFAULT 0,
           OUT "row" integer, OUT col integer,
-          OUT geom geometry)
+          OUT the_geom geometry)
       RETURNS SETOF record AS
   $$
-  SELECT i + 1 AS row, j + 1 AS col, ST_Translate(cell, j * $3 + $5, i * $4 + $6) AS geom
-  FROM generate_series(0, $1 - 1) AS i,
-       generate_series(0, $2 - 1) AS j,
-  (
-  SELECT ('POLYGON((0 0, 0 '||$4||', '||$3||' '||$4||', '||$3||' 0,0 0))')::geometry AS cell
-  ) AS foo;
+  SELECT i + 1 AS row, j + 1 AS col, ST_Translate(the_geom, j * $3 + $5, i * $4 + $6) AS the_geom
+  FROM
+    generate_series(0, $1 - 1) AS i,
+    generate_series(0, $2 - 1) AS j,
+    (
+      SELECT ('POLYGON((0 0, 0 '||$4||', '||$3||' '||$4||', '||$3||' 0,0 0))')::geometry AS the_geom
+    ) AS foo;
   $$ LANGUAGE sql IMMUTABLE STRICT;
   EOF
   db.exec sql
 end
 
-desc "create (or re-create) the locations and cells tables"
-task create_tables: :initial_setup do
-  if ! table_exists?('locations')
+desc "create the view_locations table if it doesn't exist"
+task create_view_locations: :setup do
+  if ! table_exists?('view_locations')
     sql = <<-EOF
-    CREATE TABLE locations (
+    CREATE TABLE view_locations (
       id integer primary key,
       total_views integer,
-      cell_id integer,
-      latitude numeric (8,5),
-      longitude numeric (8,5)
+      grid_square_id integer
     );
     EOF
     db.exec sql
-    db.exec "SELECT AddGeometryColumn('locations', 'point', #{srid}, 'POINT', 2, false)"
-    db.exec "create index on locations using gist (point)"
-    db.exec "create index on locations (cell_id)"
-  end
-
-  if ! table_exists?('cells')
-    db.exec "CREATE TABLE cells (id serial primary key, population integer, total_views integer, views_per_capita numeric (10,5));"
-    db.exec "SELECT AddGeometryColumn('cells', 'geom', #{srid}, 'POLYGON', 2);"
-    db.exec "CREATE INDEX ON cells USING GIST (geom);"
+    db.exec "SELECT AddGeometryColumn('view_locations', 'the_geom', #{srid}, 'POINT', 2, false)"
+    db.exec "create index on view_locations using gist (the_geom)"
+    db.exec "create index on view_locations (grid_square_id)"
   end
 end
 
-desc "populate (or re-populate) the cells table, and calcualte cell population from county data. do this after the counties data is loaded."
-task load_cells: [:create_functions, :create_tables, :load_counties] do
-# task :load_cells do
-  # build a grid that covers the entire area where we have locations
-  # parameters determined manually.
-  db.exec "delete from cells"
-  db.exec "insert into cells (geom) select ST_SetSRID(geom, #{srid}) from ST_CreateFishnet(57, 115, 1, 1, -180, 15)"
+desc "load view_locations data from TED videometrics csv exports"
+task load_view_locations: :create_view_locations do
+  db.exec "DELETE FROM view_locations"
 
-  # remove cells which have no locations
+  # from videometrics database
+  # SELECT id, latitude, longitude FROM view_locations WHERE country_id = 10;
+  # export to view_locations.csv
+  location_csv = 'source_data/view_locations.csv'
+  # SELECT location_id, count(*) as total_views FROM events WHERE happened_at BETWEEN '2015-01-01 08:00:00' AND '2015-06-01 07:59:59' GROUP BY location_id;
+  views_per_location_csv = 'source_data/views_per_location.csv'
+
+  sql_file = 'tmp/view_locations.sql'
+
+  views_per_location = {}
+  CSV.foreach(views_per_location_csv, headers: true) do |line|
+    views_per_location[line['location_id'].to_i] = line['total_views']
+  end
+
+  out = File.open(sql_file, 'w')
+  CSV.foreach(location_csv, headers: true) do |line|
+    sql = <<-EOF
+      INSERT INTO view_locations (id, total_views, the_geom)
+      VALUES (
+        #{line['id']},
+        #{views_per_location[line['id'].to_i].to_i},
+        ST_SetSRID(ST_Point(#{line['longitude']}, #{line['latitude']}), #{srid}));
+    EOF
+    out.write(sql.gsub(/\n */, " ").strip+"\n")
+  end
+  out.close
+
+  `psql #{db_name} < #{sql_file}`
+end
+
+desc "create the grid_squares table if it doesn't exist."
+task create_grid_squares: :setup do
+  if ! table_exists?('grid_squares')
+    sql = <<-EOF
+      CREATE TABLE grid_squares (
+        id serial primary key,
+        name varchar(255),
+        population integer,
+        total_views integer,
+        views_per_capita numeric (10,5)
+      )
+    EOF
+    db.exec sql
+
+    db.exec "SELECT AddGeometryColumn('grid_squares', 'the_geom', #{srid}, 'POLYGON', 2);"
+    db.exec "CREATE INDEX ON grid_squares USING GIST (the_geom);"
+  end
+end
+
+desc "populate (or re-populate) the grid_squares table, and calculate grid_square population from county data."
+task load_grid_squares: [:create_grid_squares, :load_counties] do
+  # build a grid that covers the entire area where we have view_locations
+  # parameters determined manually.
+  db.exec "delete from grid_squares"
+  db.exec "insert into grid_squares (the_geom) select ST_SetSRID(the_geom, #{srid}) from ST_CreateFishnet(57, 115, 1, 1, -180, 15)"
+
+  # remove grid_squares which have no view_locations
   # should be able to do this with one query, but getting unexpected results
   # so opting for the dumb/procedural approach instead.
-  # run select to see. (many (all?) cells join to a location with NULL id, which doesn't exist in locations table.)
-  # delete from cells where id IN (select c.id from cells c left join locations l ON (ST_Contains(c.geom, l.point)) group by c.id having count(*) = 1);
-  no_locations = []
-  result = db.exec("select id from cells")
+  # run select to see. (many (all?) grid_squares join to a location with NULL id, which doesn't exist in view_locations table.)
+  # delete from grid_squares where id IN (select c.id from grid_squares c left join view_locations l ON (ST_Contains(c.geom, l.point)) group by c.id having count(*) = 1);
+  no_view_locations = []
+  result = db.exec("select id from grid_squares")
   result.each do |row|
     sql = <<-EOF
       SELECT count(*) as location_count
-      FROM cells ce
-        LEFT JOIN locations l ON ST_Contains(ce.geom, l.point)
+      FROM grid_squares gs
+        LEFT JOIN view_locations l ON ST_Contains(gs.the_geom, l.the_geom)
       WHERE
-        ce.id = #{row['id']}
+        gs.id = #{row['id']}
         AND l.id IS NOT NULL
     EOF
     result = db.exec(sql)
     if result[0]['location_count'].to_i == 0
-      no_locations << row['id']
+      no_view_locations << row['id']
     end
   end
 
-  if no_locations.size > 0
-    db.exec("DELETE FROM cells WHERE id IN (#{no_locations.join(',')})")
+  if no_view_locations.size > 0
+    db.exec("DELETE FROM grid_squares WHERE id IN (#{no_view_locations.join(',')})")
   end
 
-  cell_count = db.exec("select count(*) as cell_count from cells")[0]['cell_count'].to_f
+  grid_square_count = db.exec("select count(*) as grid_square_count from grid_squares")[0]['grid_square_count'].to_f
 
-  result = db.exec("select id from cells")
+  result = db.exec("select id from grid_squares")
   result.each_with_index do |row, idx|
-    # find counties which overlap this cell.
-    # calculate % of the county which falls within the cell.
-    # apply that % of the county's population to the cell.
+    # find counties which overlap this grid_square.
+    # calculate % of the county which falls within the grid_square.
+    # apply that % of the county's population to the grid_square.
     # (assume the county's population is evenly distributed.)
     sql = <<-EOF
       SELECT
         co.name,
         co.pop_est_2014,
-        ST_Area(ST_Intersection(ce.geom, co.geom)) as overlap_area,
+        ST_Area(ST_Intersection(gs.the_geom, co.geom)) as overlap_area,
         ST_Area(co.geom) as total_county_area
-      FROM cells ce
-        INNER JOIN counties co ON ST_Intersects(ce.geom, co.geom)
+      FROM grid_squares gs
+        INNER JOIN counties co ON ST_Intersects(gs.the_geom, co.geom)
       WHERE
-        ce.id = #{row['id']}
+        gs.id = #{row['id']}
     EOF
 
-    cell_population = 0
+    grid_square_population = 0
     result2 = db.exec(sql)
     result2.each do |county|
-      pct_of_county_in_cell = county['overlap_area'].to_f / county['total_county_area'].to_f
-      pct_of_county_population_in_cell = pct_of_county_in_cell * county['pop_est_2014'].to_i
-      cell_population += pct_of_county_population_in_cell.to_i
+      pct_of_county_in_grid_square = county['overlap_area'].to_f / county['total_county_area'].to_f
+      pct_of_county_population_in_grid_square = pct_of_county_in_grid_square * county['pop_est_2014'].to_i
+      grid_square_population += pct_of_county_population_in_grid_square.to_i
     end
 
-    sql = "UPDATE cells SET population = #{cell_population} WHERE id = #{row['id']}"
+    sql = "UPDATE grid_squares SET population = #{grid_square_population} WHERE id = #{row['id']}"
     db.exec sql
 
     if idx > 0 && idx % 10 == 0
       print '.'
 
       if idx % 100 == 0
-        print " #{(idx/cell_count*100).round}%"
+        print " #{(idx/grid_square_count*100).round}%"
         puts
       end
     end
@@ -269,10 +312,11 @@ task load_cities: cities_tarball do
   table_name = 'cities'
   db.exec "DROP TABLE IF EXISTS #{table_name}"
 
-
   tmp_dir = "tmp/#{cities_tarball_base}"
   out_sql = "tmp/#{table_name}.sql"
 
+  # TODO merge this with load_shp_file
+  # problems: untarring doesn't create a subdir. files are untarred into the current dir.
   `rm -Rf #{tmp_dir}`
   `mkdir -p #{tmp_dir}`
   `cp #{cities_tarball} #{tmp_dir}`
@@ -283,79 +327,80 @@ task load_cities: cities_tarball do
   `psql #{db_name} < #{File.join(root_dir,out_sql)}`
 end
 
-desc "load locations data from TED videometrics csv exports"
-task load_locations: :create_tables do
-  db.exec "DELETE FROM locations"
-
-  # from videometrics database
-  # SELECT id, latitude, longitude FROM locations WHERE country_id = 10;
-  # export to locations.csv
-  location_csv = 'source_data/locations.csv'
-  # SELECT location_id, count(*) as total_views FROM events WHERE happened_at BETWEEN '2015-01-01 08:00:00' AND '2015-06-01 07:59:59' GROUP BY location_id;
-  views_per_location_csv = 'source_data/views_per_location.csv'
-
-  sql_file = 'tmp/locations.sql'
-
-  views_per_location = {}
-  CSV.foreach(views_per_location_csv, headers: true) do |line|
-    views_per_location[line['location_id'].to_i] = line['total_views']
-  end
-
-  out = File.open(sql_file, 'w')
-  CSV.foreach(location_csv, headers: true) do |line|
-    sql = <<-EOF
-      INSERT INTO locations (id, total_views, latitude, longitude, point)
-      VALUES (
-        #{line['id']},
-        #{views_per_location[line['id'].to_i].to_i},
-        #{line['latitude']},
-        #{line['longitude']},
-        ST_SetSRID(ST_Point(#{line['longitude']}, #{line['latitude']}), #{srid}));
-    EOF
-    out.write(sql.gsub(/\n */, " ").strip+"\n")
-  end
-  out.close
-
-  `psql #{db_name} < #{sql_file}`
-end
-
-desc "populate locations.cell_id foreign key, describing which cell each location is within"
-task associate_cells_and_locations: [:load_locations, :load_cells] do
+desc "populate view_locations.grid_square_id foreign key, describing which grid_square each view_location is within"
+task associate_grid_squares_and_view_locations: [:load_view_locations, :load_grid_squares] do
   sql = <<-EOF
     SELECT
-      ce.id,
+      gs.id,
       array_to_string(array_agg(l.id), ',') as location_ids
-    FROM cells ce
-      LEFT JOIN locations l ON ST_Contains(ce.geom, l.point)
+    FROM grid_squares gs
+      LEFT JOIN view_locations l ON ST_Contains(gs.the_geom, l.the_geom)
     GROUP BY
-      ce.id
+      gs.id
   EOF
   result = db.exec sql
   result.each do |row|
-    db.exec("UPDATE locations SET cell_id = #{row['id']} WHERE id IN (#{row['location_ids']})")
+    db.exec("UPDATE view_locations SET grid_square_id = #{row['id']} WHERE id IN (#{row['location_ids']})")
   end
 end
 
-desc "calcuate views per capita for all grid cells"
-task calculate_views_per_capita: :associate_cells_and_locations do
+desc "calcuate views per capita for all grid grid_squares"
+task calculate_views_per_capita: :associate_grid_squares_and_view_locations do
   sql = <<-EOF
-    UPDATE cells c
+    UPDATE grid_squares c
     SET total_views = x.total_views
     FROM (
       SELECT
-        ce.id,
+        gs.id,
         SUM(l.total_views) as total_views
-      FROM cells ce
-        INNER JOIN locations l ON (ce.id = l.cell_id)
+      FROM grid_squares gs
+        INNER JOIN view_locations l ON (gs.id = l.grid_square_id)
       GROUP BY
-        ce.id
+        gs.id
     ) x
     WHERE c.id = x.id
   EOF
   db.exec sql
 
-  db.exec "UPDATE cells SET views_per_capita = total_views/population::float WHERE population > 0"
+  db.exec "UPDATE grid_squares SET views_per_capita = total_views/population::float WHERE population > 0"
 end
 
-task default: [:calculate_views_per_capita, :load_states]
+desc "describe the largest city/town in each grid_square"
+task :assign_grid_square_names do
+  sql = <<-EOF
+    SELECT gs.id, c.name
+    FROM grid_squares gs,
+      LATERAL (
+        SELECT c.name || ', ' || c.state as name
+          FROM cities c
+        WHERE
+          ST_Intersects(gs.the_geom, c.geom)
+        ORDER BY
+          c.pop_2010 DESC NULLS LAST
+        LIMIT 1
+      ) c
+  EOF
+  result = db.exec sql
+  result.each do |row|
+    db.exec_params("UPDATE grid_squares SET name = $1 WHERE id = $2::int", [row['name'], row['id']])
+  end
+end
+
+# select
+#   name, population, views_per_capita
+# from grid_squares
+# where
+#   population > 100000
+# order by
+#   views_per_capita desc;
+
+# TODO:
+# stats on grid squares. histogram of populations.
+#   can/should we use this to decide a min population for a square?
+# exclude AWS Oregon IP addresses. import all of 2014.
+# exclude non-US views in videometrics SQL.
+# can we group by region? what's a region anyway?
+# or report per state. (square 1 is state X, square 2 is state Y, etc. overall how do states rank?)
+
+task default: [:calculate_views_per_capita, :assign_grid_square_names, :load_states]
 
