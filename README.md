@@ -17,7 +17,7 @@ and ruby. You'll just need to replace the `brew install` step with something
 appropriate for your system.
 
 ```
-$ brew install postgis
+$ brew install postgres
 # now start the postgres server
 
 $ cd views_per_capita
